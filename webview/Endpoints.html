@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <meta
+    http-equiv="Content-Security-Policy"
+    content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';"
+  />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MockGen Endpoints</title>
+
+  <style>
+    body { font-family: Arial; padding: 12px; }
+    .endpoint { padding: 6px; border-bottom: 1px solid #eee; cursor: pointer; }
+    .endpoint:hover { background: #f5f5f5; }
+    pre { background: #111; color: #eee; padding: 8px; }
+    button { margin-right: 8px; }
+  </style>
+</head>
+
+<body>
+  <div>
+    <button id="btnExport">Export</button>
+    <button id="btnToggle">Toggle JSON</button>
+  </div>
+
+  <div id="list"></div>
+  <pre id="json" style="display:none"></pre>
+
+  <script>
+    const vscode = acquireVsCodeApi();
+    const state = INITIAL_STATE;
+    let endpoints = state.endpoints || [];
+
+    const list = document.getElementById('list');
+    const json = document.getElementById('json');
+
+    function render() {
+      list.innerHTML = '';
+      json.textContent = JSON.stringify(endpoints, null, 2);
+
+      endpoints.forEach(e => {
+        const div = document.createElement('div');
+        div.className = 'endpoint';
+        div.innerHTML = `<b>${e.method || 'UNKNOWN'}</b> ${e.url}`;
+        if (e.location) {
+          div.onclick = () =>
+            vscode.postMessage({ type: 'openFile', location: e.location });
+        }
+        list.appendChild(div);
+      });
+    }
+
+    document.getElementById('btnExport').onclick = () =>
+      vscode.postMessage({ type: 'export' });
+
+    document.getElementById('btnToggle').onclick = () => {
+      json.style.display = json.style.display === 'none' ? 'block' : 'none';
+      list.style.display = json.style.display === 'none' ? 'block' : 'none';
+    };
+
+    window.addEventListener('message', e => {
+      if (e.data.type === 'update') {
+        endpoints = e.data.endpoints || [];
+        render();
+      }
+    });
+
+    render();
+  </script>
+</body>
+</html>
