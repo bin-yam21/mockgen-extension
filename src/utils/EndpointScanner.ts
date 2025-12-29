@@ -32,7 +32,16 @@
 
 import * as vscode from "vscode";
 import * as path from "path";
-import { Project, SyntaxKind } from "ts-morph";
+
+export function formatEndpoints(endpoints: Endpoint[], workspaceFolder: vscode.WorkspaceFolder) {
+  return endpoints.map(e => ({
+    file: path.relative(workspaceFolder.uri.fsPath, e.file),
+    line: e.line,
+    url: e.url,
+    method: e.method,
+    raw: e.raw,
+  }));
+}
 
 export type Endpoint = {
   file: string;
@@ -46,140 +55,170 @@ function lineNumberFromIndex(text: string, index: number) {
   return text.slice(0, index).split(/\r\n|\r|\n/).length;
 }
 
-/**
- * Scan workspace for endpoints (fetch + axios + class methods)
- */
-export async function scanEndpointsForWorkspace(
-  workspaceFolder?: vscode.WorkspaceFolder
-): Promise<Endpoint[]> {
+export async function scanEndpointsForWorkspace(workspaceFolder?: vscode.WorkspaceFolder): Promise<Endpoint[]> {
   if (!workspaceFolder) return [];
 
-  const patterns = ["**/*.js", "**/*.ts", "**/*.jsx", "**/*.tsx"];
+  const patterns = [
+    "**/*.js",
+    "**/*.ts",
+    "**/*.jsx",
+    "**/*.tsx",
+    "**/*.rs"     // 🔥 NEW: Scan Rust files
+  ];
+
   const exclude = "**/{node_modules,.git,dist,out,build,**/.mockgen/**}/**";
 
   const uris: vscode.Uri[] = [];
   for (const p of patterns) {
-    const found = await vscode.workspace.findFiles(
-      new vscode.RelativePattern(workspaceFolder, p),
-      exclude
-    );
+    const found = await vscode.workspace.findFiles(new vscode.RelativePattern(workspaceFolder, p), exclude);
     uris.push(...found);
   }
 
   const endpoints: Endpoint[] = [];
 
-  // Regex for detecting calls
+  // -------------------------
+  // JavaScript / TypeScript regex
+  // -------------------------
   const fetchRegex = /fetch\s*\(\s*([`'"])(.+?)\1/gs;
-  const axiosDefaultRegex = /axios\.(get|post|put|delete|patch|head|options)\s*\(\s*([`'"])(.+?)\2/gi;
-  const axiosCreateRegex = /(?:const|let|var)\s+([a-zA-Z_$][\w$]*)\s*=\s*axios\.create\s*\(/gi;
   const axiosCallRegex = /([a-zA-Z_$][\w$]*)\.(get|post|put|delete|patch|head|options)\s*\(\s*([`'"])(.+?)\3/gi;
+  const axiosCreateRegex = /(?:const|let|var)\s+([a-zA-Z_$][\w$]*)\s*=\s*axios\.create\s*\(/gi;
+  const axiosDefaultRegex = /axios\.(get|post|put|delete|patch|head|options)\s*\(\s*([`'"])(.+?)\2/gi;
+
+  // -------------------------
+  // Rust regex patterns
+  // -------------------------
+
+  // ⭐ Actix: web::resource("/api/users")
+  const actixResourceRegex = /web::resource\s*\(\s*["'](.+?)["']\s*\)/g;
+
+  // ⭐ Actix: .route("/login", web::post().to(handler))
+  const actixRouteRegex = /\.route\s*\(\s*["'](.+?)["']\s*,\s*web::(get|post|put|delete|patch)/gi;
+
+  // ⭐ Rocket: #[get("/api/users")]
+  const rocketRouteRegex = /#\[(get|post|put|delete|patch)\("(.+?)"\)\]/gi;
+
+  // ⭐ Axum: route("/api/users", get(handler))
+  const axumRouteRegex = /route\s*\(\s*["'](.+?)["']\s*,\s*(get|post|put|delete|patch)/gi;
 
   for (const uri of uris) {
     try {
       const bytes = await vscode.workspace.fs.readFile(uri);
       const text = Buffer.from(bytes).toString("utf8");
 
-      // Step 6: Detect axios.create instances
+      // -----------------------
+      // JS/TS: axios.create instances
+      // -----------------------
       const instanceNames = new Set<string>();
-      let match;
+      let m;
+
       axiosCreateRegex.lastIndex = 0;
-      while ((match = axiosCreateRegex.exec(text)) !== null) {
-        if (match[1]) instanceNames.add(match[1]);
+      while ((m = axiosCreateRegex.exec(text)) !== null) {
+        instanceNames.add(m[1]);
       }
 
-      // Step 5: Detect fetch()
+      // -----------------------
+      // JS/TS: fetch()
+      // -----------------------
       fetchRegex.lastIndex = 0;
-      while ((match = fetchRegex.exec(text)) !== null) {
+      while ((m = fetchRegex.exec(text)) !== null) {
         endpoints.push({
           file: uri.fsPath,
-          line: lineNumberFromIndex(text, match.index),
-          url: match[2],
+          line: lineNumberFromIndex(text, m.index),
+          url: m[2],
           method: "GET",
-          raw: match[0],
+          raw: m[0],
         });
       }
 
-      // Step 6: Detect default axios calls
+      // -----------------------
+      // JS/TS: axios.default
+      // -----------------------
       axiosDefaultRegex.lastIndex = 0;
-      while ((match = axiosDefaultRegex.exec(text)) !== null) {
+      while ((m = axiosDefaultRegex.exec(text)) !== null) {
         endpoints.push({
           file: uri.fsPath,
-          line: lineNumberFromIndex(text, match.index),
-          url: match[3],
-          method: (match[1] || "GET").toUpperCase(),
-          raw: match[0],
+          line: lineNumberFromIndex(text, m.index),
+          url: m[3],
+          method: m[1].toUpperCase(),
+          raw: m[0],
         });
       }
 
-      // Step 6: Detect axios instance calls
+      // -----------------------
+      // JS/TS: axios instance calls
+      // -----------------------
       axiosCallRegex.lastIndex = 0;
-      while ((match = axiosCallRegex.exec(text)) !== null) {
-        const instance = match[1];
+      while ((m = axiosCallRegex.exec(text)) !== null) {
+        const instance = m[1];
         if (instance === "axios" || instanceNames.has(instance)) {
           endpoints.push({
             file: uri.fsPath,
-            line: lineNumberFromIndex(text, match.index),
-            url: match[4],
-            method: (match[2] || "GET").toUpperCase(),
-            raw: match[0],
+            line: lineNumberFromIndex(text, m.index),
+            url: m[4],
+            method: m[2].toUpperCase(),
+            raw: m[0],
           });
         }
       }
 
-      // Step 7: Detect inside classes/services (TS only)
-      if (uri.fsPath.endsWith(".ts") || uri.fsPath.endsWith(".tsx")) {
-        const project = new Project({ skipAddingFilesFromTsConfig: true });
-        const sourceFile = project.addSourceFileAtPath(uri.fsPath);
-
-        for (const cls of sourceFile.getClasses()) {
-          for (const method of cls.getMethods()) {
-            const calls = method.getDescendantsOfKind(SyntaxKind.CallExpression);
-            for (const call of calls) {
-              const expr = call.getExpression().getText();
-
-              // fetch() inside class
-              if (expr === "fetch") {
-                const url = call.getArguments()[0]?.getText()?.replace(/['"`]/g, "");
-                endpoints.push({
-                  file: uri.fsPath,
-                  line: call.getStartLineNumber(),
-                  url,
-                  method: "GET",
-                  raw: call.getText(),
-                });
-              }
-
-              // default axios inside class
-              if (expr.startsWith("axios.")) {
-                const methodName = expr.split(".")[1].toUpperCase();
-                const url = call.getArguments()[0]?.getText()?.replace(/['"`]/g, "");
-                endpoints.push({
-                  file: uri.fsPath,
-                  line: call.getStartLineNumber(),
-                  url,
-                  method: methodName || "GET",
-                  raw: call.getText(),
-                });
-              }
-
-              // axios instance inside class
-              if (instanceNames.has(expr)) {
-                const methodName = call.getArguments()[1] ? "POST" : "GET";
-                const url = call.getArguments()[0]?.getText()?.replace(/['"`]/g, "");
-                endpoints.push({
-                  file: uri.fsPath,
-                  line: call.getStartLineNumber(),
-                  url,
-                  method: methodName,
-                  raw: call.getText(),
-                });
-              }
-            }
-          }
-        }
+      // -----------------------
+      // RUST: Actix (web::resource)
+      // -----------------------
+      actixResourceRegex.lastIndex = 0;
+      while ((m = actixResourceRegex.exec(text)) !== null) {
+        endpoints.push({
+          file: uri.fsPath,
+          line: lineNumberFromIndex(text, m.index),
+          url: m[1],
+          method: "GET",
+          raw: m[0],
+        });
       }
+
+      // -----------------------
+      // RUST: Actix (route)
+      // -----------------------
+      actixRouteRegex.lastIndex = 0;
+      while ((m = actixRouteRegex.exec(text)) !== null) {
+        endpoints.push({
+          file: uri.fsPath,
+          line: lineNumberFromIndex(text, m.index),
+          url: m[1],
+          method: m[2].toUpperCase(),
+          raw: m[0],
+        });
+      }
+
+      // -----------------------
+      // RUST: Rocket #[get("/x")]
+      // -----------------------
+      rocketRouteRegex.lastIndex = 0;
+      while ((m = rocketRouteRegex.exec(text)) !== null) {
+        endpoints.push({
+          file: uri.fsPath,
+          line: lineNumberFromIndex(text, m.index),
+          url: m[2],
+          method: m[1].toUpperCase(),
+          raw: m[0],
+        });
+      }
+
+      // -----------------------
+      // RUST: Axum route("/x", get)
+      // -----------------------
+      axumRouteRegex.lastIndex = 0;
+      while ((m = axumRouteRegex.exec(text)) !== null) {
+        endpoints.push({
+          file: uri.fsPath,
+          line: lineNumberFromIndex(text, m.index),
+          url: m[1],
+          method: m[2].toUpperCase(),
+          raw: m[0],
+        });
+      }
+
     } catch (err) {
-      // ignore read errors
+      continue;
     }
   }
 
@@ -191,29 +230,4 @@ export async function scanEndpointsForWorkspace(
   }
 
   return Array.from(map.values());
-}
-
-
- // Step 8: Format endpoints for display/export
- 
-export function formatEndpoints(endpoints: Endpoint[], workspaceFolder: vscode.WorkspaceFolder) {
-  return endpoints.map(e => ({
-    file: path.relative(workspaceFolder.uri.fsPath, e.file),
-    line: e.line,
-    url: e.url,
-    method: e.method,
-    raw: e.raw,
-  }));
-}
-
-
- // Optional: group endpoints by file
- 
-export function groupEndpointsByFile(formatted: ReturnType<typeof formatEndpoints>) {
-  const grouped: Record<string, typeof formatted> = {};
-  for (const e of formatted) {
-    if (!grouped[e.file]) grouped[e.file] = [];
-    grouped[e.file].push(e);
-  }
-  return grouped;
 }
