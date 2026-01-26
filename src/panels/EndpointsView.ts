@@ -1,24 +1,24 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
+import type { Endpoint } from '../types/endpoint';
 
-export type Endpoint = {
-  method?: string;
-  url: string;
-  location?: string;
-  meta?: Record<string, any>;
-};
-
+// Use a module-level variable for single panel instance
 let panel: vscode.WebviewPanel | undefined;
 
+/**
+ * Create or reveal the Endpoint WebView panel.
+ * @returns The WebviewPanel
+ */
 export function createEndpointsPanel(
   context: vscode.ExtensionContext,
   endpoints: Endpoint[]
-) {
+): vscode.WebviewPanel {
+  // If panel already exists, reveal and update
   if (panel) {
     panel.reveal();
     panel.webview.postMessage({ type: 'update', endpoints });
-    return;
+    return panel; // ← now always returns panel
   }
 
   panel = vscode.window.createWebviewPanel(
@@ -40,13 +40,11 @@ export function createEndpointsPanel(
   );
 
   let html = fs.readFileSync(htmlPath.fsPath, 'utf8');
-  html = html.replace(
-    'INITIAL_STATE',
-    JSON.stringify({ endpoints })
-  );
+  html = html.replace('INITIAL_STATE', JSON.stringify({ endpoints }));
 
   panel.webview.html = html;
 
+  // Listen to messages from WebView
   panel.webview.onDidReceiveMessage((msg) => {
     if (msg.type === 'export') {
       vscode.commands.executeCommand('mockgen.exportEndpoints');
@@ -57,9 +55,16 @@ export function createEndpointsPanel(
     }
   });
 
-  panel.onDidDispose(() => (panel = undefined));
+  panel.onDidDispose(() => {
+    panel = undefined; // Reset panel reference when closed
+  });
+
+  return panel; // ← always return panel
 }
 
+/**
+ * Opens a file at a specific line number
+ */
 async function openFileAtLocation(location: string) {
   const [filePath, lineStr] = location.split(':');
   const line = Math.max(0, Number(lineStr || 1) - 1);

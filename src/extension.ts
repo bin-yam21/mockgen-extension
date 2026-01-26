@@ -1,130 +1,313 @@
 import * as vscode from "vscode";
+import * as fs from "fs";
 import * as path from "path";
+
+import { generateMock } from "./utils/mockGenerator";
 import {
   scanEndpointsForWorkspace,
-  formatEndpoints
+  formatEndpoints,
 } from "./utils/EndpointScanner";
+import { writeEndpointsFile } from "./utils/fileWriter";
 import { createEndpointsPanel } from "./panels/EndpointsView";
-import { writeEndpointsFile } from "./utils/filewriter";
+import { showEmptyState, showError } from "./utils/errors";
+import { startMockServer } from "./server/mockServer";
+import { generateSwagger } from "./utils/swaggerGenerator";
+import type { Endpoint } from "./types/endpoint";
+import { createSwaggerPanel } from "./panels/SwaggerView";
+import { DashboardPanel } from "./panels/DashboardPanel";
+import {
+  notifySuccess,
+  notifyError,
+  notifyWarn,
+} from "./utils/notifications";
+
+/* =========================
+   Workspace Helper (CRITICAL FIX)
+========================= */
+function getWorkspace() {
+  const folders = vscode.workspace.workspaceFolders;
+  if (!folders || folders.length === 0) {
+    vscode.window.showErrorMessage(
+      "MockGen: Open a folder (File → Open Folder) before running this command."
+    );
+    return null;
+  }
+  return folders[0];
+}
 
 export function activate(context: vscode.ExtensionContext) {
-  console.log("MockGen extension active");
+  console.log("🚀 MockGen extension activated");
 
-  // 1️⃣ Scan Endpoints
+  let panel: vscode.WebviewPanel | undefined;
+  let serverInstance: any;
+
+  /* =========================
+     Status Bar (Phase H)
+  ========================= */
+  const statusStart = vscode.window.createStatusBarItem(
+    vscode.StatusBarAlignment.Left,
+    100
+  );
+  statusStart.text = "▶ MockGen";
+  statusStart.command = "mockgen.startMockServer";
+  statusStart.tooltip = "Start Mock Server";
+
+  const statusStop = vscode.window.createStatusBarItem(
+    vscode.StatusBarAlignment.Left,
+    99
+  );
+  statusStop.text = "⏹ Stop";
+  statusStop.command = "mockgen.stopMockServer";
+  statusStop.tooltip = "Stop Mock Server";
+
+  const statusReload = vscode.window.createStatusBarItem(
+    vscode.StatusBarAlignment.Left,
+    98
+  );
+  statusReload.text = "🔄 Reload";
+  statusReload.command = "mockgen.reloadMockServer";
+  statusReload.tooltip = "Reload Mocks";
+
+  context.subscriptions.push(statusStart, statusStop, statusReload);
+
+  function updateStatus(running: boolean) {
+    if (running) {
+      statusStart.hide();
+      statusStop.show();
+      statusReload.show();
+    } else {
+      statusStart.show();
+      statusStop.hide();
+      statusReload.hide();
+    }
+  }
+
+  updateStatus(false);
+  statusStart.show();
+
+  /* =========================
+     1️⃣ Scan Endpoints
+  ========================= */
   const scanCommand = vscode.commands.registerCommand(
     "mockgen.scanEndpoints",
     async () => {
-      const wf = vscode.workspace.workspaceFolders;
-      if (!wf?.length) {
-        vscode.window.showErrorMessage("Open a workspace folder first.");
-        return;
+      try {
+        const workspace = getWorkspace();
+        if (!workspace) return;
+
+        const endpoints = await scanEndpointsForWorkspace(workspace);
+        if (!endpoints.length) return showEmptyState();
+
+        await writeEndpointsFile(endpoints);
+        notifySuccess(`Found ${endpoints.length} endpoints`);
+
+        if (panel) {
+          panel.webview.postMessage({ type: "update", endpoints });
+        }
+      } catch (err) {
+        showError(err);
       }
-
-      const root = wf[0];
-      const endpoints = await scanEndpointsForWorkspace(root);
-
-      if (!endpoints.length) {
-        vscode.window.showInformationMessage("No endpoints found.");
-        return;
-      }
-
-      const formatted = formatEndpoints(endpoints, root);
-
-      const outDir = vscode.Uri.joinPath(root.uri, ".mockgen");
-      await vscode.workspace.fs.createDirectory(outDir);
-      const outFile = vscode.Uri.joinPath(outDir, "endpoints.json");
-
-      await vscode.workspace.fs.writeFile(
-        outFile,
-        Buffer.from(JSON.stringify(formatted, null, 2), "utf8")
-      );
-
-      vscode.window.showInformationMessage(
-        `Found ${formatted.length} endpoints — saved to .mockgen/endpoints.json`
-      );
-
-      const doc = await vscode.workspace.openTextDocument(outFile);
-      await vscode.window.showTextDocument(doc);
     }
   );
 
-  // 2️⃣ Generate Mock API
+  /* =========================
+     2️⃣ Generate Mock API
+  ========================= */
   const generateMockCommand = vscode.commands.registerCommand(
     "mockgen.generateMockApi",
     async () => {
-      const wf = vscode.workspace.workspaceFolders;
-      if (!wf?.length) return;
+      try {
+        const workspace = getWorkspace();
+        if (!workspace) return;
 
-      const root = wf[0];
-      const endpoints = await scanEndpointsForWorkspace(root);
-      if (!endpoints.length) return;
+        const workspaceRoot = workspace.uri.fsPath;
+        const endpoints = await scanEndpointsForWorkspace(workspace);
+        if (!endpoints.length) return showEmptyState();
 
-      const mock: Record<string, any> = {};
-      for (const e of endpoints) {
-        mock[e.url] = {
-          method: e.method,
-          response: {
-            message: `Mock response for ${e.url}`,
-            example:
-              e.method === "GET"
-                ? [{ id: 1, name: "example" }]
-                : { id: 1, created: true }
-          }
-        };
+        const formatted = formatEndpoints(endpoints, workspace);
+        const mocks: Record<string, any> = {};
+
+        for (const e of formatted) {
+          mocks[e.url] = {
+            method: e.method,
+            ...generateMock(e, workspaceRoot),
+          };
+        }
+
+        const outDir = path.join(workspaceRoot, ".mockgen");
+        fs.mkdirSync(outDir, { recursive: true });
+
+        const outFile = path.join(outDir, "mock.json");
+        fs.writeFileSync(outFile, JSON.stringify(mocks, null, 2));
+
+        const doc = await vscode.workspace.openTextDocument(outFile);
+        await vscode.window.showTextDocument(doc);
+
+        notifySuccess(`Generated mocks for ${formatted.length} endpoints`);
+      } catch (err) {
+        showError(err);
       }
-
-      const outDir = vscode.Uri.joinPath(root.uri, ".mockgen");
-      await vscode.workspace.fs.createDirectory(outDir);
-      const outFile = vscode.Uri.joinPath(outDir, "mock.json");
-
-      await vscode.workspace.fs.writeFile(
-        outFile,
-        Buffer.from(JSON.stringify(mock, null, 2), "utf8")
-      );
-
-      const doc = await vscode.workspace.openTextDocument(outFile);
-      await vscode.window.showTextDocument(doc);
     }
   );
 
-  // 3️⃣ Show WebView Endpoint Report
+  /* =========================
+     3️⃣ Start Mock Server
+  ========================= */
+  const startServerCommand = vscode.commands.registerCommand(
+    "mockgen.startMockServer",
+    async () => {
+      const workspace = getWorkspace();
+      if (!workspace) return;
+
+      if (serverInstance) {
+        notifyWarn("Mock server already running");
+        return;
+      }
+
+      try {
+        serverInstance = startMockServer(workspace.uri.fsPath, 3000);
+        updateStatus(true);
+        notifySuccess("Mock server started on port 3000");
+      } catch (err) {
+        notifyError("Failed to start mock server");
+      }
+    }
+  );
+
+  /* =========================
+     4️⃣ Stop Mock Server
+  ========================= */
+  const stopServerCommand = vscode.commands.registerCommand(
+    "mockgen.stopMockServer",
+    async () => {
+      if (!serverInstance) {
+        notifyWarn("Mock server not running");
+        return;
+      }
+
+      serverInstance.closeServer?.();
+      serverInstance = null;
+      updateStatus(false);
+      notifySuccess("Mock server stopped");
+    }
+  );
+
+  /* =========================
+     5️⃣ Reload Mocks
+  ========================= */
+  const reloadServerCommand = vscode.commands.registerCommand(
+    "mockgen.reloadMockServer",
+    async () => {
+      if (!serverInstance) {
+        notifyWarn("Mock server not running");
+        return;
+      }
+
+      serverInstance.reloadMocks?.();
+      notifySuccess("Mocks reloaded");
+    }
+  );
+
+  /* =========================
+     6️⃣ Endpoint Report
+  ========================= */
   const showReportCommand = vscode.commands.registerCommand(
     "mockgen.showEndpointReport",
     async () => {
-      const wf = vscode.workspace.workspaceFolders;
-      if (!wf?.length) return;
+      const workspace = getWorkspace();
+      if (!workspace) return;
 
-      const root = wf[0];
-      const endpoints = await scanEndpointsForWorkspace(root);
+      const endpoints = await scanEndpointsForWorkspace(workspace);
+      const formatted = formatEndpoints(endpoints, workspace);
+      if (!formatted.length) return showEmptyState();
 
-      const viewData = endpoints.map(e => ({
-        method: e.method,
-        url: e.url,
-        location: `${path.relative(root.uri.fsPath, e.file)}:${e.line}`
-      }));
-
-      createEndpointsPanel(context, viewData);
+      panel = createEndpointsPanel(context, formatted);
     }
   );
 
-  // 4️⃣ Export via WebView button
-  const exportCommand = vscode.commands.registerCommand(
-    "mockgen.exportEndpoints",
+  /* =========================
+     7️⃣ Swagger + Dashboard
+  ========================= */
+  const swaggerCommand = vscode.commands.registerCommand(
+    "mockgen.generateSwagger",
     async () => {
-      const wf = vscode.workspace.workspaceFolders;
-      if (!wf?.length) return;
+      const workspace = getWorkspace();
+      if (!workspace) return;
 
-      const endpoints = await scanEndpointsForWorkspace(wf[0]);
-      await writeEndpointsFile(endpoints);
+      const endpointsFile = path.join(
+        workspace.uri.fsPath,
+        ".mockgen",
+        "endpoints.json"
+      );
+      if (!fs.existsSync(endpointsFile)) return showEmptyState();
+
+      const endpoints: Endpoint[] = JSON.parse(
+        fs.readFileSync(endpointsFile, "utf-8")
+      );
+
+      const swaggerFile = generateSwagger(endpoints, workspace.uri.fsPath);
+      const doc = await vscode.workspace.openTextDocument(swaggerFile);
+      await vscode.window.showTextDocument(doc);
+
+      notifySuccess("Swagger generated");
+    }
+  );
+
+  const viewSwaggerCommand = vscode.commands.registerCommand(
+    "mockgen.viewSwagger",
+    async () => {
+      const workspace = getWorkspace();
+      if (!workspace) return;
+
+      const swaggerFile = path.join(
+        workspace.uri.fsPath,
+        ".mockgen",
+        "swagger.json"
+      );
+      if (!fs.existsSync(swaggerFile)) {
+        notifyError("Swagger not found");
+        return;
+      }
+
+      createSwaggerPanel(context, swaggerFile);
+    }
+  );
+
+  const dashboardCommand = vscode.commands.registerCommand(
+    "mockgen.viewDashboard",
+    async () => {
+      const workspace = getWorkspace();
+      if (!workspace) return;
+
+      const root = workspace.uri.fsPath;
+      const endpointsFile = path.join(root, ".mockgen", "endpoints.json");
+      const swaggerFile = path.join(root, ".mockgen", "swagger.json");
+
+      if (!fs.existsSync(endpointsFile) || !fs.existsSync(swaggerFile)) {
+        notifyError("Generate endpoints & Swagger first");
+        return;
+      }
+
+      const endpoints = JSON.parse(fs.readFileSync(endpointsFile, "utf-8"));
+      const swagger = JSON.parse(fs.readFileSync(swaggerFile, "utf-8"));
+
+      DashboardPanel.show(context, endpoints, swagger);
     }
   );
 
   context.subscriptions.push(
     scanCommand,
     generateMockCommand,
+    startServerCommand,
+    stopServerCommand,
+    reloadServerCommand,
     showReportCommand,
-    exportCommand
+    swaggerCommand,
+    viewSwaggerCommand,
+    dashboardCommand
   );
 }
 
-export function deactivate() {}
+export function deactivate() {
+  // server cleanup handled by VS Code
+}
