@@ -1,48 +1,9 @@
-// import { Project, SyntaxKind } from "ts-morph";
-
-// export function scanEndpoints(tsConfigPath: string) {
-//     const project = new Project({
-//         tsConfigFilePath: tsConfigPath,
-//         skipAddingFilesFromTsConfig: false,
-//     });
-
-//     // Load files
-//     // project.addSourceFilesAtPaths("**/*.ts");
-//     // project.addSourceFilesAtPaths("**/*.js");
-
-//     const results: string[] = [];
-
-//     for (const file of project.getSourceFiles()) {
-//         const calls = file.getDescendantsOfKind(SyntaxKind.CallExpression);
-
-//         for (const call of calls) {
-//             const expression = call.getExpression().getText();
-
-//             if (expression === "fetch") {
-//                 const args = call.getArguments();
-//                 const url = args[0]?.getText()?.replace(/['"`]/g, "") || "";
-//                 results.push(url);
-//             }
-//         }
-//     }
-
-//     return results;
-// }
-
-
 import * as vscode from "vscode";
 import * as path from "path";
 
-export function formatEndpoints(endpoints: Endpoint[], workspaceFolder: vscode.WorkspaceFolder) {
-  return endpoints.map(e => ({
-    file: path.relative(workspaceFolder.uri.fsPath, e.file),
-    line: e.line,
-    url: e.url,
-    method: e.method,
-    raw: e.raw,
-  }));
-}
-
+/* =========================
+   Types
+========================= */
 export type Endpoint = {
   file: string;
   line: number;
@@ -51,90 +12,112 @@ export type Endpoint = {
   raw?: string;
 };
 
+/* =========================
+   Helpers
+========================= */
+function extractFetchMethod(options?: string): string {
+  if (!options) return "GET";
+  const match = options.match(/method\s*:\s*['"`](GET|POST|PUT|DELETE|PATCH)['"`]/i);
+  return match ? match[1].toUpperCase() : "GET";
+}
+
 function lineNumberFromIndex(text: string, index: number) {
   return text.slice(0, index).split(/\r\n|\r|\n/).length;
 }
 
-export async function scanEndpointsForWorkspace(workspaceFolder?: vscode.WorkspaceFolder): Promise<Endpoint[]> {
+/* =========================
+   Formatter
+========================= */
+export function formatEndpoints(
+  endpoints: Endpoint[],
+  workspaceFolder: vscode.WorkspaceFolder
+) {
+  const root = workspaceFolder.uri.fsPath;
+
+  return endpoints
+    .map(e => ({
+      file: path.relative(root, e.file),
+      line: e.line,
+      url: e.url.trim(),
+      method: e.method.toUpperCase(),
+      location: `${path.relative(root, e.file)}:${e.line}`,
+      ...(e.raw ? { raw: e.raw } : {}),
+    }))
+    .sort((a, b) => {
+      if (a.file !== b.file) return a.file.localeCompare(b.file);
+      if (a.line !== b.line) return a.line - b.line;
+      if (a.method !== b.method) return a.method.localeCompare(b.method);
+      return a.url.localeCompare(b.url);
+    });
+}
+
+/* =========================
+   Scanner
+========================= */
+export async function scanEndpointsForWorkspace(
+  workspaceFolder?: vscode.WorkspaceFolder
+): Promise<Endpoint[]> {
   if (!workspaceFolder) return [];
 
-  const patterns = [
-    "**/*.js",
-    "**/*.ts",
-    "**/*.jsx",
-    "**/*.tsx",
-    "**/*.rs"     // 🔥 NEW: Scan Rust files
-  ];
-
+  const patterns = ["**/*.js", "**/*.ts", "**/*.jsx", "**/*.tsx", "**/*.rs"];
   const exclude = "**/{node_modules,.git,dist,out,build,**/.mockgen/**}/**";
 
   const uris: vscode.Uri[] = [];
   for (const p of patterns) {
-    const found = await vscode.workspace.findFiles(new vscode.RelativePattern(workspaceFolder, p), exclude);
-    uris.push(...found);
+    uris.push(...(await vscode.workspace.findFiles(
+      new vscode.RelativePattern(workspaceFolder, p),
+      exclude
+    )));
   }
 
   const endpoints: Endpoint[] = [];
 
-  // -------------------------
-  // JavaScript / TypeScript regex
-  // -------------------------
-  const fetchRegex = /fetch\s*\(\s*([`'"])(.+?)\1/gs;
+  /* =========================
+     Regex Definitions
+  ========================== */
+  const fetchRegex = /fetch\s*\(\s*(['"`])([^'"`]+)\1\s*(?:,\s*({[\s\S]*?}))?\s*\)/g;
+
+  // ✅ Robust Express regex
+  const expressRouteRegex = /(app|router)\.(get|post|put|delete|patch)\s*\(\s*['"`]([^'"`]+)['"`]/gi;
+
   const axiosCallRegex = /([a-zA-Z_$][\w$]*)\.(get|post|put|delete|patch|head|options)\s*\(\s*([`'"])(.+?)\3/gi;
   const axiosCreateRegex = /(?:const|let|var)\s+([a-zA-Z_$][\w$]*)\s*=\s*axios\.create\s*\(/gi;
   const axiosDefaultRegex = /axios\.(get|post|put|delete|patch|head|options)\s*\(\s*([`'"])(.+?)\2/gi;
+  const axiosConfigRegex = /axios\s*\(\s*{[\s\S]*?method\s*:\s*['"`](get|post|put|delete|patch)['"`][\s\S]*?url\s*:\s*['"`](.+?)['"`][\s\S]*?}\s*\)/gi;
 
-  // -------------------------
-  // Rust regex patterns
-  // -------------------------
-
-  // ⭐ Actix: web::resource("/api/users")
   const actixResourceRegex = /web::resource\s*\(\s*["'](.+?)["']\s*\)/g;
-
-  // ⭐ Actix: .route("/login", web::post().to(handler))
   const actixRouteRegex = /\.route\s*\(\s*["'](.+?)["']\s*,\s*web::(get|post|put|delete|patch)/gi;
-
-  // ⭐ Rocket: #[get("/api/users")]
   const rocketRouteRegex = /#\[(get|post|put|delete|patch)\("(.+?)"\)\]/gi;
-
-  // ⭐ Axum: route("/api/users", get(handler))
   const axumRouteRegex = /route\s*\(\s*["'](.+?)["']\s*,\s*(get|post|put|delete|patch)/gi;
 
+  /* =========================
+     Scan Each File
+  ========================== */
   for (const uri of uris) {
     try {
-      const bytes = await vscode.workspace.fs.readFile(uri);
-      const text = Buffer.from(bytes).toString("utf8");
-
-      // -----------------------
-      // JS/TS: axios.create instances
-      // -----------------------
+      const text = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString("utf8");
       const instanceNames = new Set<string>();
-      let m;
+      let m: RegExpExecArray | null;
 
+      // Axios instances
       axiosCreateRegex.lastIndex = 0;
-      while ((m = axiosCreateRegex.exec(text)) !== null) {
-        instanceNames.add(m[1]);
-      }
+      while ((m = axiosCreateRegex.exec(text))) instanceNames.add(m[1]);
 
-      // -----------------------
-      // JS/TS: fetch()
-      // -----------------------
+      // Fetch
       fetchRegex.lastIndex = 0;
-      while ((m = fetchRegex.exec(text)) !== null) {
+      while ((m = fetchRegex.exec(text))) {
         endpoints.push({
           file: uri.fsPath,
           line: lineNumberFromIndex(text, m.index),
-          url: m[2],
-          method: "GET",
+          url: m[2].trim(),
+          method: extractFetchMethod(m[3]),
           raw: m[0],
         });
       }
 
-      // -----------------------
-      // JS/TS: axios.default
-      // -----------------------
+      // Axios default
       axiosDefaultRegex.lastIndex = 0;
-      while ((m = axiosDefaultRegex.exec(text)) !== null) {
+      while ((m = axiosDefaultRegex.exec(text))) {
         endpoints.push({
           file: uri.fsPath,
           line: lineNumberFromIndex(text, m.index),
@@ -144,13 +127,22 @@ export async function scanEndpointsForWorkspace(workspaceFolder?: vscode.Workspa
         });
       }
 
-      // -----------------------
-      // JS/TS: axios instance calls
-      // -----------------------
+      // Axios config
+      axiosConfigRegex.lastIndex = 0;
+      while ((m = axiosConfigRegex.exec(text))) {
+        endpoints.push({
+          file: uri.fsPath,
+          line: lineNumberFromIndex(text, m.index),
+          url: m[2],
+          method: m[1].toUpperCase(),
+          raw: m[0],
+        });
+      }
+
+      // Axios instance calls
       axiosCallRegex.lastIndex = 0;
-      while ((m = axiosCallRegex.exec(text)) !== null) {
-        const instance = m[1];
-        if (instance === "axios" || instanceNames.has(instance)) {
+      while ((m = axiosCallRegex.exec(text))) {
+        if (m[1] === "axios" || instanceNames.has(m[1])) {
           endpoints.push({
             file: uri.fsPath,
             line: lineNumberFromIndex(text, m.index),
@@ -161,73 +153,41 @@ export async function scanEndpointsForWorkspace(workspaceFolder?: vscode.Workspa
         }
       }
 
-      // -----------------------
-      // RUST: Actix (web::resource)
-      // -----------------------
-      actixResourceRegex.lastIndex = 0;
-      while ((m = actixResourceRegex.exec(text)) !== null) {
-        endpoints.push({
-          file: uri.fsPath,
-          line: lineNumberFromIndex(text, m.index),
-          url: m[1],
-          method: "GET",
-          raw: m[0],
-        });
-      }
+      // Rust / backend
+      [actixResourceRegex, actixRouteRegex, rocketRouteRegex, axumRouteRegex].forEach(regex => {
+        regex.lastIndex = 0;
+        while ((m = regex.exec(text))) {
+          const method = (m[2] || "GET").toUpperCase();
+          const url = m[1] || m[2];
+          if (url) endpoints.push({
+            file: uri.fsPath,
+            line: lineNumberFromIndex(text, m.index),
+            url,
+            method,
+            raw: m[0],
+          });
+        }
+      });
 
-      // -----------------------
-      // RUST: Actix (route)
-      // -----------------------
-      actixRouteRegex.lastIndex = 0;
-      while ((m = actixRouteRegex.exec(text)) !== null) {
+      // Express
+      expressRouteRegex.lastIndex = 0;
+      while ((m = expressRouteRegex.exec(text))) {
         endpoints.push({
           file: uri.fsPath,
           line: lineNumberFromIndex(text, m.index),
-          url: m[1],
+          url: m[3],
           method: m[2].toUpperCase(),
           raw: m[0],
         });
       }
 
-      // -----------------------
-      // RUST: Rocket #[get("/x")]
-      // -----------------------
-      rocketRouteRegex.lastIndex = 0;
-      while ((m = rocketRouteRegex.exec(text)) !== null) {
-        endpoints.push({
-          file: uri.fsPath,
-          line: lineNumberFromIndex(text, m.index),
-          url: m[2],
-          method: m[1].toUpperCase(),
-          raw: m[0],
-        });
-      }
-
-      // -----------------------
-      // RUST: Axum route("/x", get)
-      // -----------------------
-      axumRouteRegex.lastIndex = 0;
-      while ((m = axumRouteRegex.exec(text)) !== null) {
-        endpoints.push({
-          file: uri.fsPath,
-          line: lineNumberFromIndex(text, m.index),
-          url: m[1],
-          method: m[2].toUpperCase(),
-          raw: m[0],
-        });
-      }
-
-    } catch (err) {
+    } catch {
       continue;
     }
   }
 
   // Deduplicate
   const map = new Map<string, Endpoint>();
-  for (const e of endpoints) {
-    const key = `${e.file}::${e.url}::${e.method}`;
-    if (!map.has(key)) map.set(key, e);
-  }
-
+  for (const e of endpoints) map.set(`${e.file}::${e.url}::${e.method}`, e);
   return Array.from(map.values());
 }

@@ -2,21 +2,15 @@
   "compilerOptions": {
     "target": "ES2022",
     "module": "Node16",
-
     "lib": ["ES2022", "DOM"],
-
     "rootDir": "src",
     "outDir": "out",
-
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
-
     "allowJs": true,
     "checkJs": false,
-
     "moduleResolution": "node16",
-
     "sourceMap": true
   },
   "include": ["src/**/*"]
