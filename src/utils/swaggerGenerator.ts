@@ -1,7 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import type { Endpoint } from "../types/endpoint";
-import { generateMock } from "./mockGenerator";
+import { generateMock, generateRequestBody } from "./mockGenerator";
 import { inferSchema } from "./schemaInfer";
 
 /**
@@ -40,6 +40,7 @@ export function generateSwagger(endpoints: Endpoint[], rootPath: string): string
     }
 
     const mock = generateMock(ep, rootPath);
+    const requestBody = generateRequestBody(ep);
 
     // Schema name
     const schemaName = ep.url
@@ -57,11 +58,11 @@ export function generateSwagger(endpoints: Endpoint[], rootPath: string): string
           content: {
             "application/json": {
               schema: inferSchema(
-                mock.body ?? {},
+                requestBody,
                 capitalize(schemaName) + "Request",
                 swagger.components.schemas
               ),
-              example: mock.body ?? {},
+              example: requestBody,
             },
           },
           required: true,

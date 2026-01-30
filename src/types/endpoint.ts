@@ -5,4 +5,5 @@ export type Endpoint = {
   method: string;
   location: string;
   raw?: string;
+  mock?: any;
 };

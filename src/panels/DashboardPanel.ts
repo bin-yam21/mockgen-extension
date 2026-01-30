@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import type { Endpoint } from "../types/endpoint";
 import * as path from "path";
+import * as fs from "fs";
 
 /**
  * DashboardPanel
@@ -10,13 +11,14 @@ export class DashboardPanel {
   private static currentPanel: DashboardPanel | undefined;
   private readonly panel: vscode.WebviewPanel;
   private disposables: vscode.Disposable[] = [];
-  
+  private mocksWatcher: fs.FSWatcher | null = null;
 
   private constructor(
     panel: vscode.WebviewPanel,
     private context: vscode.ExtensionContext,
     private endpoints: Endpoint[],
-    private swaggerJson: any
+    private swaggerJson: any,
+    private workspaceRoot: string,
   ) {
     this.panel = panel;
 
@@ -25,7 +27,7 @@ export class DashboardPanel {
     this.panel.webview.onDidReceiveMessage(
       (msg) => this.handleMessage(msg),
       null,
-      this.disposables
+      this.disposables,
     );
 
     this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
@@ -35,9 +37,11 @@ export class DashboardPanel {
   public static show(
     context: vscode.ExtensionContext,
     endpoints: Endpoint[],
-    swaggerJson: any
+    swaggerJson: any,
+    workspaceRoot: string,
   ) {
-    const column = vscode.window.activeTextEditor?.viewColumn || vscode.ViewColumn.One;
+    const column =
+      vscode.window.activeTextEditor?.viewColumn || vscode.ViewColumn.One;
 
     if (DashboardPanel.currentPanel) {
       DashboardPanel.currentPanel.panel.reveal(column);
@@ -49,10 +53,16 @@ export class DashboardPanel {
       "mockgenDashboard",
       "MockGen Dashboard",
       column,
-      { enableScripts: true, retainContextWhenHidden: true }
+      { enableScripts: true, retainContextWhenHidden: true },
     );
 
-    DashboardPanel.currentPanel = new DashboardPanel(panel, context, endpoints, swaggerJson);
+    DashboardPanel.currentPanel = new DashboardPanel(
+      panel,
+      context,
+      endpoints,
+      swaggerJson,
+      workspaceRoot,
+    );
   }
 
   /** Update the dashboard */
@@ -66,26 +76,168 @@ export class DashboardPanel {
   private handleMessage(msg: any) {
     switch (msg.type) {
       case "downloadSwagger":
-        const swaggerFile = path.join(this.context.extensionUri.fsPath, ".mockgen", "swagger.json");
-        vscode.env.openExternal(vscode.Uri.file(swaggerFile));
-        vscode.window.showInformationMessage("Swagger JSON downloaded.");
+        this.openLocalFile(
+          ".mockgen/swagger.json",
+          "Swagger JSON opened in editor.",
+        );
         break;
 
       case "downloadMocks":
-        const mocksFile = path.join(this.context.extensionUri.fsPath, ".mockgen", "mock.json");
-        vscode.env.openExternal(vscode.Uri.file(mocksFile));
-        vscode.window.showInformationMessage("Mock bundle downloaded.");
+        this.openLocalFile(
+          ".mockgen/mock.json",
+          "Mock bundle opened in editor.",
+        );
+        break;
+
+      case "updateMock":
+        this.persistMock(msg.endpoint, msg.newMock);
+        break;
+
+      case "openEditMock":
+        this.openEditorForMock(msg.endpoint, msg.mock);
+        break;
+
+      case "copyEndpoint":
+        vscode.env.clipboard
+          .writeText(msg.url)
+          .then(() =>
+            vscode.window.showInformationMessage(
+              `Copied endpoint URL: ${msg.url}`,
+            ),
+          );
         break;
     }
   }
 
- private getHtml(): string {
-  const nonce = getNonce();
-  const swaggerJsUri = `https://unpkg.com/swagger-ui-dist/swagger-ui-bundle.js`;
-  const swaggerCssUri = `https://unpkg.com/swagger-ui-dist/swagger-ui.css`;
-  const chartJsUri = `https://cdn.jsdelivr.net/npm/chart.js`;
+  private async openLocalFile(relativePath: string, successMessage: string) {
+    const fullPath = path.join(this.workspaceRoot, relativePath);
+    if (!fs.existsSync(fullPath)) {
+      vscode.window.showErrorMessage(
+        `MockGen: File not found at ${relativePath}. Generate assets first.`,
+      );
+      return;
+    }
+    try {
+      const doc = await vscode.workspace.openTextDocument(fullPath);
+      await vscode.window.showTextDocument(doc);
+      vscode.window.showInformationMessage(successMessage);
+    } catch (err) {
+      // Fallback to external if opening in editor fails
+      vscode.env.openExternal(vscode.Uri.file(fullPath));
+      vscode.window.showInformationMessage(successMessage);
+    }
+  }
 
-  return `
+  private persistMock(endpointUrl: string, mockBody: any) {
+    const mocksPath = path.join(this.workspaceRoot, ".mockgen", "mock.json");
+    const dir = path.dirname(mocksPath);
+    fs.mkdirSync(dir, { recursive: true });
+
+    let mocks: Record<string, any> = {};
+    if (fs.existsSync(mocksPath)) {
+      try {
+        mocks = JSON.parse(fs.readFileSync(mocksPath, "utf-8"));
+      } catch {
+        // fall back to empty if corrupted
+      }
+    }
+
+    mocks[endpointUrl] = {
+      ...(mocks[endpointUrl] || {}),
+      body: mockBody?.body ?? mockBody,
+      status: mockBody?.status ?? mocks[endpointUrl]?.status ?? 200,
+    };
+
+    fs.writeFileSync(mocksPath, JSON.stringify(mocks, null, 2), "utf-8");
+
+    // Update local state so charts reflect change
+    this.endpoints = this.endpoints.map((ep) =>
+      ep.url === endpointUrl ? { ...ep, mock: mocks[endpointUrl] } : ep,
+    );
+    this.panel.webview.postMessage({
+      type: "updateEndpoints",
+      endpoints: this.endpoints,
+    });
+    vscode.window.showInformationMessage("Mock saved to .mockgen/mock.json");
+  }
+
+  private async openEditorForMock(endpointUrl: string, currentMock: any) {
+    const mocksPath = path.join(this.workspaceRoot, ".mockgen", "mock.json");
+    const dir = path.dirname(mocksPath);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+    // Ensure file exists
+    if (!fs.existsSync(mocksPath)) {
+      const initial: Record<string, any> = {};
+      if (currentMock) {
+        initial[endpointUrl] = currentMock;
+      }
+      fs.writeFileSync(mocksPath, JSON.stringify(initial, null, 2), "utf-8");
+    }
+
+    try {
+      const doc = await vscode.workspace.openTextDocument(mocksPath);
+      const editor = await vscode.window.showTextDocument(doc);
+
+      // Try to find the key for the endpoint and reveal it
+      const text = doc.getText();
+      const keyIndex = text.indexOf(JSON.stringify(endpointUrl));
+      if (keyIndex >= 0) {
+        const before = text.slice(0, keyIndex);
+        const line = before.split(/\r\n|\r|\n/).length - 1;
+        const pos = new vscode.Position(line, 0);
+        editor.selection = new vscode.Selection(pos, pos);
+        editor.revealRange(new vscode.Range(pos, pos));
+      }
+
+      // Start watching the mock file for changes so the webview updates
+      if (!this.mocksWatcher) {
+        try {
+          this.mocksWatcher = fs.watch(mocksPath, { persistent: false }, () => {
+            this.reloadMocksIntoEndpoints(mocksPath);
+          });
+          this.disposables.push(
+            new vscode.Disposable(() => this.mocksWatcher?.close()),
+          );
+        } catch {
+          // ignore watcher errors
+        }
+      }
+
+      vscode.window.showInformationMessage(
+        `Edit mock for ${endpointUrl} and save the file to apply changes.`,
+      );
+    } catch (err) {
+      vscode.window.showErrorMessage("Failed to open mock file for editing.");
+    }
+  }
+
+  private reloadMocksIntoEndpoints(mocksPath: string) {
+    try {
+      const raw = fs.readFileSync(mocksPath, "utf-8");
+      const mocks = JSON.parse(raw || "{}");
+
+      this.endpoints = this.endpoints.map((ep) => ({
+        ...ep,
+        mock: mocks[ep.url] ?? ep.mock,
+      }));
+
+      this.panel.webview.postMessage({
+        type: "updateEndpoints",
+        endpoints: this.endpoints,
+      });
+    } catch {
+      // ignore parse errors
+    }
+  }
+
+  private getHtml(): string {
+    const nonce = getNonce();
+    const swaggerJsUri = `https://unpkg.com/swagger-ui-dist/swagger-ui-bundle.js`;
+    const swaggerCssUri = `https://unpkg.com/swagger-ui-dist/swagger-ui.css`;
+    const chartJsUri = `https://cdn.jsdelivr.net/npm/chart.js`;
+
+    return `
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -114,6 +266,8 @@ export class DashboardPanel {
   button.small:hover { background:#005a9e; }
   #empty { text-align:center; color:gray; margin-top:40px; }
   canvas { max-width:100%; background:white; border-radius:8px; padding:12px; }
+  .stats { display:flex; gap:12px; margin-top:12px; flex-wrap:wrap; }
+  .stat { background:white; padding:10px 12px; border-radius:6px; border:1px solid #e5e7eb; font-weight:600; color:#1e1e1e; }
 </style>
 </head>
 <body>
@@ -152,7 +306,7 @@ export class DashboardPanel {
 
 <div id="tab-charts">
   <canvas id="methodChart"></canvas>
-  <canvas id="coverageChart" style="margin-top:16px;"></canvas>
+  <div class="stats" id="coverageStats"></div>
 </div>
 
 <script nonce="${nonce}" src="${swaggerJsUri}"></script>
@@ -161,7 +315,7 @@ export class DashboardPanel {
 const vscode = acquireVsCodeApi();
 let endpoints = ${JSON.stringify(this.endpoints)};
 let swaggerJson = ${JSON.stringify(this.swaggerJson)};
-let methodChart, coverageChart;
+let methodChart;
 
 function showTab(tab){
   document.getElementById('tab-endpoints').style.display = tab==='endpoints'?'block':'none';
@@ -207,7 +361,7 @@ function renderEndpoints(){
     const copyBtn=document.createElement('button');
     copyBtn.textContent='Copy';
     copyBtn.className='small';
-    copyBtn.onclick=()=>navigator.clipboard.writeText(ep.url);
+    copyBtn.onclick=()=>copyEndpoint(ep.url);
     const editBtn=document.createElement('button');
     editBtn.textContent='Edit Mock';
     editBtn.className='small';
@@ -222,14 +376,12 @@ function renderEndpoints(){
 }
 
 function editMock(ep){
-  const newMock = prompt('Edit mock JSON:', JSON.stringify(ep.mock||{},null,2));
-  if(newMock){
-    try{
-      ep.mock=JSON.parse(newMock);
-      vscode.postMessage({type:'updateMock', endpoint:ep.url, newMock:ep.mock});
-      renderCharts();
-    }catch(err){ alert('Invalid JSON'); }
-  }
+  // Open the mock for this endpoint in the workspace editor
+  vscode.postMessage({type:'openEditMock', endpoint:ep.url, mock:ep.mock||{}});
+}
+
+function copyEndpoint(url){
+  vscode.postMessage({type:'copyEndpoint', url});
 }
 
 function renderSwagger(){
@@ -253,12 +405,12 @@ function renderCharts(){
     options:{responsive:true, plugins:{legend:{display:false}}}
   });
 
-  if(coverageChart) coverageChart.destroy();
-  coverageChart=new Chart(document.getElementById('coverageChart'), {
-    type:'doughnut',
-    data:{labels:['Mocked','Missing'],datasets:[{data:[mocked,missing],backgroundColor:['#28a745','#dc3545']}]},
-    options:{responsive:true, plugins:{legend:{position:'bottom'}}}
-  });
+  const coverage = document.getElementById('coverageStats');
+  coverage.innerHTML = '';
+  const stat = document.createElement('div');
+  stat.className='stat';
+  stat.textContent = \`Mocked: \${mocked} • Missing: \${missing} • Total: \${total}\`;
+  coverage.appendChild(stat);
 }
 
 // Attach event listeners
@@ -286,20 +438,21 @@ window.addEventListener('message', event=>{
 </body>
 </html>
 `;
-}
-
+  }
 
   public dispose() {
     DashboardPanel.currentPanel = undefined;
     this.panel.dispose();
-    this.disposables.forEach(d => d.dispose());
+    this.disposables.forEach((d) => d.dispose());
   }
 }
 
 /* Helpers */
-function getNonce(){
-  let text="";
-  const possible="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  for(let i=0;i<32;i++) text+=possible.charAt(Math.floor(Math.random()*possible.length));
+function getNonce() {
+  let text = "";
+  const possible =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  for (let i = 0; i < 32; i++)
+    text += possible.charAt(Math.floor(Math.random() * possible.length));
   return text;
 }
